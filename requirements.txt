@@ -1,0 +1,9 @@
+torch>=2.0
+torchaudio>=2.0
+sentencepiece
+lhotse
+k2
+fastapi
+uvicorn[standard]
+websockets
+numpy
