@@ -34,6 +34,7 @@ FBANK_CHUNK_SIZE = CHUNK_SIZE * 2 + PAD_LENGTH  # 45
 FRAME_SHIFT_MS = 10.0
 SAMPLE_RATE = 16000
 SAMPLES_PER_CHUNK = int(FBANK_CHUNK_SHIFT * FRAME_SHIFT_MS / 1000 * SAMPLE_RATE)  # 5120
+DECODER_RESET_WARMUP_CHUNKS = 4
 
 
 class OnlineASRSession:
@@ -82,13 +83,15 @@ class OnlineASRSession:
         self._decoder_tokens: List[int] = [params.sos_id]
         self._enc_wait_positions: List[int] = []
         self._total_enc_frames: int = 0
+        self._decoder_warmup_chunks: int = 0
+        self._pending_decoder_memory: List[torch.Tensor] = []
         self._all_text: str = ""
         self._chunk_count: int = 0
 
         # Audio sample buffer
         self._audio_buffer = torch.empty(0, dtype=torch.float32)
         log.info(
-            "OnlineASRSession: chunk_shift=%d fbank_frames, full stream reset on sentence punctuation",
+            "OnlineASRSession: chunk_shift=%d fbank_frames; sentence punctuation resets decoder only",
             FBANK_CHUNK_SHIFT,
         )
 
@@ -234,17 +237,31 @@ class OnlineASRSession:
         )
         encoder_out = encoder_out.permute(1, 0, 2)  # (1, T_out, C)
         chunk_enc_frames = encoder_out.shape[1]
-        self._total_enc_frames += chunk_enc_frames
 
         log.info("  encoder done: out_frames=%d, total_enc_frames=%d",
-                 chunk_enc_frames, self._total_enc_frames)
+                 chunk_enc_frames, self._total_enc_frames + chunk_enc_frames)
 
-        # Record wait position: last frame of accumulated encoder output
+        self._total_enc_frames += chunk_enc_frames
         self._enc_wait_positions.append(self._total_enc_frames - 1)
+
+        if self._decoder_warmup_chunks > 0:
+            self._pending_decoder_memory.append(encoder_out)
+            self._decoder_warmup_chunks -= 1
+            log.info(
+                "  decoder warmup: buffered chunk, remaining=%d",
+                self._decoder_warmup_chunks,
+            )
+            if self._decoder_warmup_chunks > 0:
+                return ""
+
+            decoder_memory = torch.cat(self._pending_decoder_memory, dim=1)
+            self._pending_decoder_memory = []
+        else:
+            decoder_memory = encoder_out
 
         # --- Attention Decoder with KV Cache ---
         new_tokens, hit_wait, hit_eos = self._streaming_decode(
-            new_enc_frames=encoder_out,
+            new_enc_frames=decoder_memory,
             add_new_memory=True,
         )
 
@@ -258,10 +275,13 @@ class OnlineASRSession:
         if not hit_wait and not hit_eos:
             log.warning(
                 "  decoder runaway: generated %d tokens without wait/eos; "
-                "dropping chunk text and resetting stream state",
+                "dropping chunk text and resetting decoder state",
                 len(new_tokens),
             )
-            self._reset_stream_state(reason="decoder runaway")
+            self._reset_decoder_state(
+                reason="decoder runaway",
+                warmup_chunks=DECODER_RESET_WARMUP_CHUNKS,
+            )
             return ""
 
         self._decoder_tokens.extend(new_tokens)
@@ -273,16 +293,20 @@ class OnlineASRSession:
         ]
         decoded_text = self.sp.decode(content_tokens) if content_tokens else ""
 
-        if hit_eos:
-            self._reset_stream_state(reason="decoder eos")
-        elif self._ends_with_sentence_boundary(decoded_text):
-            log.info(
-                "  sentence boundary detected after text=%r; resetting stream state",
-                decoded_text,
+        if hit_eos and not hit_wait:
+            # A real, separately trained EOS can end the current decoder segment.
+            # Keep acoustic states alive so the next segment does not lose frames.
+            self._reset_decoder_state(
+                reason="decoder eos",
+                warmup_chunks=DECODER_RESET_WARMUP_CHUNKS,
             )
-            self._reset_stream_state(
+        elif hit_wait and self._ends_with_sentence_boundary(decoded_text):
+            # The current model is trained with <wait>, not a separate EOS.  Treat
+            # sentence punctuation as a decoder segment boundary only; acoustic
+            # states must remain continuous to avoid dropping new-sentence audio.
+            self._reset_decoder_state(
                 reason="sentence punctuation",
-                reset_frontend=False,
+                warmup_chunks=DECODER_RESET_WARMUP_CHUNKS,
             )
         return decoded_text
 
@@ -323,6 +347,14 @@ class OnlineASRSession:
             add_new_memory = False
 
             next_token = logits.argmax(dim=-1).item()
+
+            if next_token == eos_id and eos_id == self.params.sos_id:
+                log.info(
+                    "  decoder emitted shared <sos/eos>; treating it as <wait> "
+                    "for continuous wait-token streaming"
+                )
+                next_token = wait_id
+
             current_tokens.append(next_token)
             new_tokens.append(next_token)
 
@@ -333,26 +365,24 @@ class OnlineASRSession:
 
         return new_tokens, False, False
 
-    def _reset_stream_state(self, reason: str, reset_frontend: bool = True) -> None:
-        """Start a new segment with fresh model state.
+    def _reset_stream_state(self, reason: str) -> None:
+        """Fully reset acoustic and decoder state.
 
-        For punctuation-based segmentation we keep frontend buffers because the
-        current 45-frame encoder window contains 13 lookahead frames that the next
-        segment still needs. Dropping them loses about 130-320 ms near the boundary.
+        Use this only when the current stream/session is being discarded. Keeping
+        frontend buffers while resetting encoder state misaligns the 13-frame
+        lookahead window used by encoder_embed.streaming_forward.
         """
         log.info(
-            "  reset stream state (%s): reset_frontend=%s, audio_buffer=%d samples, fbank_buffer=%d frames",
+            "  reset stream state (%s): audio_buffer=%d samples, fbank_buffer=%d frames",
             reason,
-            reset_frontend,
             self._audio_buffer.numel(),
             self._fbank_buffer.shape[0],
         )
 
         # Audio / feature front-end state.
-        if reset_frontend:
-            self._audio_buffer = torch.empty(0, dtype=torch.float32)
-            self._fbank_buffer = torch.empty(0, 80)
-            self.fbank.reset()
+        self._audio_buffer = torch.empty(0, dtype=torch.float32)
+        self._fbank_buffer = torch.empty(0, 80)
+        self.fbank.reset()
 
         # Encoder states.
         self._embed_cache = self.model.encoder_embed.get_init_states(
@@ -364,9 +394,16 @@ class OnlineASRSession:
         self._processed_lens = torch.zeros(1, dtype=torch.int64, device=self.device)
 
         # Decoder states.
+        self._reset_decoder_state(reason=reason)
+
+    def _reset_decoder_state(self, reason: str, warmup_chunks: int = 0) -> None:
+        """Reset attention-decoder segmentation without dropping acoustic context."""
+        log.info("  reset decoder state (%s), warmup_chunks=%d", reason, warmup_chunks)
         self._decoder_tokens = [self.params.sos_id]
         self._enc_wait_positions = []
         self._total_enc_frames = 0
+        self._decoder_warmup_chunks = warmup_chunks
+        self._pending_decoder_memory = []
         self._kv_cache.reset()
 
     @staticmethod

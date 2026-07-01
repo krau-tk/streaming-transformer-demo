@@ -10,9 +10,11 @@ from fastapi.staticfiles import StaticFiles
 
 import torchaudio
 
-from full_encoder_decode import recognize_full_encoder_waveform
 from model_loader import ASREngine
-from online_session import OnlineASRSession
+from pseudo_streaming_session import (
+    PseudoStreamingASRSession,
+    recognize_pseudo_streaming_waveform,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -47,13 +49,18 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 @app.websocket("/ws/asr")
 async def websocket_asr(ws: WebSocket):
     await ws.accept()
-    session = OnlineASRSession(
+    session = PseudoStreamingASRSession(
         model=engine.model,
         sp=engine.sp,
         params=engine.params,
         device=engine.device,
+        decode_interval_samples=1.28 * 16000,
+        min_decode_samples=1.28 * 16000,
+        soft_segment_samples=1.28 * 8 * 16000,
+        hard_segment_samples=1.28 * 14 * 16000,
+        num_decode_chunks=4,
     )
-    log.info("New true-streaming ASR session started")
+    log.info("New pseudo-streaming full-encoder ASR session started")
 
     try:
         while True:
@@ -90,13 +97,13 @@ async def websocket_asr(ws: WebSocket):
 @app.post("/api/recognize")
 async def recognize_file(
     file: UploadFile = File(...),
-    num_decode_chunks: int = Query(1, ge=1, le=16),
+    num_decode_chunks: int = Query(4, ge=1, le=16),
 ):
-    """Offline recognition using the reference full-encoder decode path."""
+    """Offline recognition using segmented pseudo-streaming full-encoder decode."""
     import io
 
     log.info(
-        "Offline recognize(full-encoder): %s, num_decode_chunks=%d",
+        "Offline recognize(pseudo-streaming full-encoder): %s, num_decode_chunks=%d",
         file.filename,
         num_decode_chunks,
     )
@@ -118,7 +125,7 @@ async def recognize_file(
     log.info("  Audio: %.2fs, %d samples", audio_duration, waveform.shape[1])
 
     try:
-        result = recognize_full_encoder_waveform(
+        result = recognize_pseudo_streaming_waveform(
             model=engine.model,
             sp=engine.sp,
             params=engine.params,
@@ -130,10 +137,10 @@ async def recognize_file(
         return JSONResponse({"error": str(e)}, status_code=400)
 
     log.info(
-        "  Result: %s (encoder_frames=%d, chunks=%d, elapsed=%.2fs)",
+        "  Result: %s (decode_calls=%d, committed_segments=%d, elapsed=%.2fs)",
         result["text"],
-        result["encoder_frames"],
-        result["decode_chunks"],
+        result["decode_calls"],
+        result["committed_segments"],
         result["elapsed"],
     )
 
