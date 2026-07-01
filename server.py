@@ -12,7 +12,7 @@ import torchaudio
 
 from full_encoder_decode import recognize_full_encoder_waveform
 from model_loader import ASREngine
-from pseudo_streaming_session import PseudoStreamingASRSession
+from online_session import OnlineASRSession
 
 logging.basicConfig(
     level=logging.INFO,
@@ -47,18 +47,13 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 @app.websocket("/ws/asr")
 async def websocket_asr(ws: WebSocket):
     await ws.accept()
-    session = PseudoStreamingASRSession(
+    session = OnlineASRSession(
         model=engine.model,
         sp=engine.sp,
         params=engine.params,
         device=engine.device,
-        decode_interval_samples=16000,
-        min_decode_samples=16000,
-        soft_segment_samples=10 * 16000,
-        hard_segment_samples=20 * 16000,
-        num_decode_chunks=4,
     )
-    log.info("New pseudo-streaming ASR session started")
+    log.info("New true-streaming ASR session started")
 
     try:
         while True:

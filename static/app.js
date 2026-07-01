@@ -1,6 +1,6 @@
 const SAMPLE_RATE = 16000;
-const CHUNK_DURATION_MS = 450;
-const CHUNK_SAMPLES = Math.floor(SAMPLE_RATE * CHUNK_DURATION_MS / 1000);  // 7200
+const CHUNK_DURATION_MS = 320;
+const CHUNK_SAMPLES = Math.floor(SAMPLE_RATE * CHUNK_DURATION_MS / 1000);  // 5120
 
 let ws = null;
 let audioCtx = null;

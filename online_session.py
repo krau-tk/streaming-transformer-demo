@@ -17,19 +17,23 @@ from attention_decoder_stream import KVCache  # noqa: E402
 from icefall.utils import make_pad_mask  # noqa: E402
 
 log = logging.getLogger(__name__)
+SENTENCE_END_CHARS = set("。！？!?.")
 
 # Chunk sizing:
 # chunk_size = 16 (encoder-level frames after Conv2dSubsampling)
 # pad_length = 7 + 2*3 = 13  (Conv2d kernel + ConvNeXt padding)
 # fbank_chunk_size = chunk_size * 2 + pad_length = 45 fbank frames per chunk
+# fbank_chunk_shift = chunk_size * 2 = 32 fbank frames per step
 # At 10ms frame shift: 45 frames = 450ms of audio
+# Each new encoder call advances by 32 frames = 320ms, keeping 13 frames overlap
 # After Zipformer2 output_downsampling_factor=2: 16 → 8 encoder output frames per chunk
 CHUNK_SIZE = 16
 PAD_LENGTH = 7 + 2 * 3  # 13
+FBANK_CHUNK_SHIFT = CHUNK_SIZE * 2  # 32
 FBANK_CHUNK_SIZE = CHUNK_SIZE * 2 + PAD_LENGTH  # 45
 FRAME_SHIFT_MS = 10.0
 SAMPLE_RATE = 16000
-SAMPLES_PER_CHUNK = int(FBANK_CHUNK_SIZE * FRAME_SHIFT_MS / 1000 * SAMPLE_RATE)  # 7200
+SAMPLES_PER_CHUNK = int(FBANK_CHUNK_SHIFT * FRAME_SHIFT_MS / 1000 * SAMPLE_RATE)  # 5120
 
 
 class OnlineASRSession:
@@ -83,6 +87,10 @@ class OnlineASRSession:
 
         # Audio sample buffer
         self._audio_buffer = torch.empty(0, dtype=torch.float32)
+        log.info(
+            "OnlineASRSession: chunk_shift=%d fbank_frames, full stream reset on sentence punctuation",
+            FBANK_CHUNK_SHIFT,
+        )
 
     def feed_audio(self, pcm_int16_bytes: bytes) -> Optional[Dict]:
         """Feed raw PCM int16 bytes, return result dict if new text is produced.
@@ -101,7 +109,8 @@ class OnlineASRSession:
             len(pcm_int16_bytes), len(samples), self._audio_buffer.numel(), SAMPLES_PER_CHUNK
         )
 
-        # Process complete chunks
+        # Process complete audio steps. The fbank/encoder window itself keeps
+        # 13 frames overlap, matching the exported streaming examples.
         new_text_parts = []
         while self._audio_buffer.numel() >= SAMPLES_PER_CHUNK:
             chunk_samples = self._audio_buffer[:SAMPLES_PER_CHUNK]
@@ -127,14 +136,18 @@ class OnlineASRSession:
             if fbank.numel() > 0:
                 self._fbank_buffer = torch.cat([self._fbank_buffer, fbank])
 
-        # If we have leftover fbank frames, pad to full chunk and process
+        # Process any complete windows first, then pad the final partial window.
+        while self._fbank_buffer.shape[0] >= FBANK_CHUNK_SIZE:
+            fbank_chunk = self._fbank_buffer[:FBANK_CHUNK_SIZE]
+            self._fbank_buffer = self._fbank_buffer[FBANK_CHUNK_SHIFT:]
+            text = self._run_encoder_decoder(fbank_chunk)
+            if text:
+                self._all_text += text
+
         if self._fbank_buffer.shape[0] > 0:
             pad_needed = FBANK_CHUNK_SIZE - self._fbank_buffer.shape[0]
-            if pad_needed > 0:
-                padding = torch.full((pad_needed, 80), -23.0)  # log(1e-10) ≈ -23
-                fbank_chunk = torch.cat([self._fbank_buffer, padding])
-            else:
-                fbank_chunk = self._fbank_buffer[:FBANK_CHUNK_SIZE]
+            padding = torch.full((pad_needed, 80), -23.0)  # log(1e-10) ≈ -23
+            fbank_chunk = torch.cat([self._fbank_buffer, padding])
             self._fbank_buffer = torch.empty(0, 80)
             text = self._run_encoder_decoder(fbank_chunk)
             if text:
@@ -159,11 +172,13 @@ class OnlineASRSession:
         log.info("  fbank extracted: %d frames, buffer=%d, need=%d",
                  fbank.shape[0], self._fbank_buffer.shape[0], FBANK_CHUNK_SIZE)
 
-        # Process all complete fbank chunks
+        # Process all complete fbank windows. Each encoder call sees 45 frames
+        # but we advance by only 32 frames, preserving the 13-frame lookahead
+        # required by Conv2dSubsampling.streaming_forward.
         text_parts = []
         while self._fbank_buffer.shape[0] >= FBANK_CHUNK_SIZE:
             fbank_chunk = self._fbank_buffer[:FBANK_CHUNK_SIZE]
-            self._fbank_buffer = self._fbank_buffer[FBANK_CHUNK_SIZE:]
+            self._fbank_buffer = self._fbank_buffer[FBANK_CHUNK_SHIFT:]
 
             text = self._run_encoder_decoder(fbank_chunk)
             if text:
@@ -228,23 +243,48 @@ class OnlineASRSession:
         self._enc_wait_positions.append(self._total_enc_frames - 1)
 
         # --- Attention Decoder with KV Cache ---
-        new_tokens, hit_wait = self._streaming_decode(
+        new_tokens, hit_wait, hit_eos = self._streaming_decode(
             new_enc_frames=encoder_out,
             add_new_memory=True,
         )
 
-        self._decoder_tokens.extend(new_tokens)
+        log.info(
+            "  decoder done: new_tokens=%s, hit_wait=%s, hit_eos=%s",
+            new_tokens,
+            hit_wait,
+            hit_eos,
+        )
 
-        log.info("  decoder done: new_tokens=%s, hit_wait=%s", new_tokens, hit_wait)
+        if not hit_wait and not hit_eos:
+            log.warning(
+                "  decoder runaway: generated %d tokens without wait/eos; "
+                "dropping chunk text and resetting stream state",
+                len(new_tokens),
+            )
+            self._reset_stream_state(reason="decoder runaway")
+            return ""
+
+        self._decoder_tokens.extend(new_tokens)
 
         # Decode tokens (strip wait/eos)
         content_tokens = [
             t for t in new_tokens
             if t != self.params.wait_id and t != self.params.eos_id
         ]
-        if content_tokens:
-            return self.sp.decode(content_tokens)
-        return ""
+        decoded_text = self.sp.decode(content_tokens) if content_tokens else ""
+
+        if hit_eos:
+            self._reset_stream_state(reason="decoder eos")
+        elif self._ends_with_sentence_boundary(decoded_text):
+            log.info(
+                "  sentence boundary detected after text=%r; resetting stream state",
+                decoded_text,
+            )
+            self._reset_stream_state(
+                reason="sentence punctuation",
+                reset_frontend=False,
+            )
+        return decoded_text
 
     def _streaming_decode(
         self,
@@ -287,11 +327,52 @@ class OnlineASRSession:
             new_tokens.append(next_token)
 
             if next_token == wait_id:
-                return new_tokens, True
+                return new_tokens, True, False
             if next_token == eos_id:
-                return new_tokens, False
+                return new_tokens, False, True
 
-        return new_tokens, False
+        return new_tokens, False, False
+
+    def _reset_stream_state(self, reason: str, reset_frontend: bool = True) -> None:
+        """Start a new segment with fresh model state.
+
+        For punctuation-based segmentation we keep frontend buffers because the
+        current 45-frame encoder window contains 13 lookahead frames that the next
+        segment still needs. Dropping them loses about 130-320 ms near the boundary.
+        """
+        log.info(
+            "  reset stream state (%s): reset_frontend=%s, audio_buffer=%d samples, fbank_buffer=%d frames",
+            reason,
+            reset_frontend,
+            self._audio_buffer.numel(),
+            self._fbank_buffer.shape[0],
+        )
+
+        # Audio / feature front-end state.
+        if reset_frontend:
+            self._audio_buffer = torch.empty(0, dtype=torch.float32)
+            self._fbank_buffer = torch.empty(0, 80)
+            self.fbank.reset()
+
+        # Encoder states.
+        self._embed_cache = self.model.encoder_embed.get_init_states(
+            batch_size=1, device=self.device
+        )
+        self._encoder_states = self.model.encoder.get_init_states(
+            batch_size=1, device=self.device
+        )
+        self._processed_lens = torch.zeros(1, dtype=torch.int64, device=self.device)
+
+        # Decoder states.
+        self._decoder_tokens = [self.params.sos_id]
+        self._enc_wait_positions = []
+        self._total_enc_frames = 0
+        self._kv_cache.reset()
+
+    @staticmethod
+    def _ends_with_sentence_boundary(text: str) -> bool:
+        stripped = text.rstrip()
+        return bool(stripped) and stripped[-1] in SENTENCE_END_CHARS
 
     def _final_decode_pass(self) -> str:
         """Run one more decode pass without new memory to get remaining tokens."""
