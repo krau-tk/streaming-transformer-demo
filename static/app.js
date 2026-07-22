@@ -20,10 +20,41 @@ const btnStop = document.getElementById('btn-stop');
 const transcript = document.getElementById('transcript');
 const statusDot = document.getElementById('status-dot');
 const statusText = document.getElementById('status-text');
+const modeInputs = Array.from(document.querySelectorAll('input[name="session-mode"]'));
 
 function setStatus(state, text) {
     statusDot.className = 'status-dot ' + state;
     statusText.textContent = text;
+}
+
+function getSelectedMode() {
+    const selected = document.querySelector('input[name="session-mode"]:checked');
+    return selected ? selected.value : 'pseudo';
+}
+
+function setModeInputsDisabled(disabled) {
+    modeInputs.forEach(input => {
+        input.disabled = disabled;
+    });
+}
+
+function getAsrWsUrl() {
+    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const mode = encodeURIComponent(getSelectedMode());
+    return `${protocol}//${location.host}/ws/asr?mode=${mode}`;
+}
+
+function handleAsrMessage(event) {
+    const data = JSON.parse(event.data);
+    if (data.error) {
+        transcript.textContent = '[错误] ' + data.error;
+        setStatus('', '识别错误');
+        return;
+    }
+    transcript.textContent = data.text;
+    if (data.is_final) {
+        setStatus('connected', '识别完成');
+    }
 }
 
 function connectWebSocket() {
@@ -31,21 +62,14 @@ function connectWebSocket() {
         return;
     }
 
-    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    ws = new WebSocket(`${protocol}//${location.host}/ws/asr`);
+    ws = new WebSocket(getAsrWsUrl());
 
     ws.onopen = () => {
         setStatus('connected', '已连接，准备就绪');
         btnStart.disabled = false;
     };
 
-    ws.onmessage = (event) => {
-        const data = JSON.parse(event.data);
-        transcript.textContent = data.text;
-        if (data.is_final) {
-            setStatus('connected', '识别完成');
-        }
-    };
+    ws.onmessage = handleAsrMessage;
 
     ws.onclose = () => {
         ws = null;
@@ -53,6 +77,7 @@ function connectWebSocket() {
             // Connection lost during recording
             cleanupAudio();
             isRecording = false;
+            setModeInputsDisabled(false);
             btnStart.style.display = 'inline-block';
             btnStop.style.display = 'none';
         }
@@ -95,8 +120,7 @@ async function startRecording() {
     await new Promise(r => setTimeout(r, 100));
     shouldReconnect = true;
 
-    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    ws = new WebSocket(`${protocol}//${location.host}/ws/asr`);
+    ws = new WebSocket(getAsrWsUrl());
 
     ws.onopen = () => {
         // Start audio processing now that WS is ready
@@ -104,24 +128,20 @@ async function startRecording() {
         isRecording = true;
         sampleBuffer = [];
         transcript.textContent = '';
+        setModeInputsDisabled(true);
         setStatus('recording', '正在录音...');
         btnStart.style.display = 'none';
         btnStop.style.display = 'inline-block';
     };
 
-    ws.onmessage = (event) => {
-        const data = JSON.parse(event.data);
-        transcript.textContent = data.text;
-        if (data.is_final) {
-            setStatus('connected', '识别完成');
-        }
-    };
+    ws.onmessage = handleAsrMessage;
 
     ws.onclose = () => {
         ws = null;
         if (isRecording) {
             cleanupAudio();
             isRecording = false;
+            setModeInputsDisabled(false);
             btnStart.style.display = 'inline-block';
             btnStop.style.display = 'none';
         }
@@ -248,6 +268,7 @@ function stopRecording() {
     }
 
     cleanupAudio();
+    setModeInputsDisabled(false);
     setStatus('connected', '处理中...');
     btnStart.style.display = 'inline-block';
     btnStop.style.display = 'none';
@@ -255,6 +276,22 @@ function stopRecording() {
 
 btnStart.addEventListener('click', startRecording);
 btnStop.addEventListener('click', stopRecording);
+modeInputs.forEach(input => {
+    input.addEventListener('change', () => {
+        if (isRecording) return;
+        transcript.textContent = '';
+        shouldReconnect = false;
+        if (ws) {
+            ws.onclose = null;
+            ws.close();
+            ws = null;
+        }
+        shouldReconnect = true;
+        btnStart.disabled = true;
+        setStatus('', '正在连接...');
+        connectWebSocket();
+    });
+});
 
 // === File upload (offline recognition) ===
 const fileInput = document.getElementById('file-input');
@@ -284,7 +321,8 @@ btnUpload.addEventListener('click', async () => {
     formData.append('file', file);
 
     try {
-        const resp = await fetch('/api/recognize', { method: 'POST', body: formData });
+        const mode = encodeURIComponent(getSelectedMode());
+        const resp = await fetch(`/api/recognize?mode=${mode}`, { method: 'POST', body: formData });
         const data = await resp.json();
 
         if (data.error) {

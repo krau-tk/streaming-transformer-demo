@@ -18,6 +18,7 @@ import argparse
 import logging
 import sys
 import time
+from datetime import date as _date
 from pathlib import Path
 
 import torch
@@ -26,11 +27,11 @@ import torchaudio
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-PROJ_DIR = Path("/nfs/bichunhao/uag-zipformer-transformer-streaming")
+PROJ_DIR = Path("/nfs_tmk/asr/bichunhao/uag-zipformer-transformer-streaming")
 sys.path.insert(0, str(PROJ_DIR / "zipformer"))
 sys.path.insert(0, str(Path("/nfs/asr/icefall")))
 
-from model_loader import ASREngine  # noqa: E402
+from model_loader import ASREngine, EXP_NAME  # noqa: E402
 from online_session import OnlineASRSession, SAMPLES_PER_CHUNK, FBANK_CHUNK_SIZE  # noqa: E402
 from decode_stream_attention_kv_cache import (  # noqa: E402
     compute_chunk_boundaries,
@@ -175,11 +176,46 @@ def main():
     # Load model
     engine = ASREngine(device=args.device)
 
+    # Set up file logging per mode
+    log_dir = Path(__file__).parent / "log"
+    log_dir.mkdir(exist_ok=True)
+    session_loggers = [logging.getLogger("online_session"),
+                       logging.getLogger("pseudo_streaming_session"),
+                       logging.getLogger("__main__")]
+    file_handlers = []
+    modes_to_log = []
+    if args.mode in ("streaming", "both"):
+        modes_to_log.append("online")
     if args.mode in ("full-encoder", "both"):
+        modes_to_log.append("full-encoder")
+    for m in modes_to_log:
+        fname = f"{EXP_NAME}_{m}_{_date.today().strftime('%Y%m%d')}.txt"
+        fh = logging.FileHandler(log_dir / fname, mode="w")
+        fh.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
+        fh.setLevel(logging.INFO)
+        file_handlers.append((m, fh))
+
+    if args.mode in ("full-encoder", "both"):
+        fh = next((h for m, h in file_handlers if m == "full-encoder"), None)
+        if fh:
+            for lg in session_loggers:
+                lg.addHandler(fh)
         text_full = test_full_encoder_mode(engine, waveform)
+        if fh:
+            for lg in session_loggers:
+                lg.removeHandler(fh)
+            fh.close()
 
     if args.mode in ("streaming", "both"):
+        fh = next((h for m, h in file_handlers if m == "online"), None)
+        if fh:
+            for lg in session_loggers:
+                lg.addHandler(fh)
         text_stream = test_streaming_mode(engine, waveform)
+        if fh:
+            for lg in session_loggers:
+                lg.removeHandler(fh)
+            fh.close()
 
     if args.mode == "both":
         log.info("")

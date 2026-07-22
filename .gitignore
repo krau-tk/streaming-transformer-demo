@@ -7,7 +7,7 @@ __pycache__/
 dist/
 build/
 .eggs/
-
+log/
 # Virtual environments
 venv/
 env/
@@ -32,3 +32,7 @@ Thumbs.db
 *.onnx
 *.bin
 *.safetensors
+
+*.mp3
+*.m4a
+*.txt

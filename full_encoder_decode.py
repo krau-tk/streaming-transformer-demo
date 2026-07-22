@@ -7,7 +7,7 @@ from typing import Dict, List
 import torch
 import torchaudio
 
-PROJ_DIR = Path("/nfs/bichunhao/uag-zipformer-transformer-streaming")
+PROJ_DIR = Path("/nfs_tmk/asr/bichunhao/uag-zipformer-transformer-streaming")
 ICEFALL_ROOT = Path("/nfs/asr/icefall")
 
 sys.path.insert(0, str(PROJ_DIR / "zipformer"))

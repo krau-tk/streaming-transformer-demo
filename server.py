@@ -1,4 +1,5 @@
 import logging
+from datetime import date as _date
 from pathlib import Path
 
 from contextlib import asynccontextmanager
@@ -10,10 +11,16 @@ from fastapi.staticfiles import StaticFiles
 
 import torchaudio
 
-from model_loader import ASREngine
+from model_loader import ASREngine, EXP_NAME
 from pseudo_streaming_session import (
     PseudoStreamingASRSession,
     recognize_pseudo_streaming_waveform,
+)
+from online_session import (
+    DEFAULT_DECODER_STEP_CHUNKS,
+    SAMPLES_PER_CHUNK,
+    SegmentedOnlineASRSession,
+    recognize_online_streaming_waveform,
 )
 
 logging.basicConfig(
@@ -24,6 +31,40 @@ log = logging.getLogger(__name__)
 
 engine: ASREngine = None
 STATIC_DIR = Path(__file__).parent / "static"
+PSEUDO_NUM_DECODE_CHUNKS = 4
+PSEUDO_DECODE_INTERVAL_SAMPLES = PSEUDO_NUM_DECODE_CHUNKS * SAMPLES_PER_CHUNK
+
+
+LOG_DIR = Path(__file__).parent / "log"
+
+_SESSION_LOGGERS = ["online_session", "pseudo_streaming_session", "__main__"]
+
+
+def _make_log_handler(mode: str) -> logging.FileHandler:
+    LOG_DIR.mkdir(exist_ok=True)
+    filename = f"{EXP_NAME}_{mode}_{_date.today().strftime('%Y%m%d')}.txt"
+    handler = logging.FileHandler(LOG_DIR / filename)
+    handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
+    handler.setLevel(logging.INFO)
+    return handler
+
+
+def _attach_handler(handler: logging.FileHandler):
+    for name in _SESSION_LOGGERS:
+        logging.getLogger(name).addHandler(handler)
+
+
+def _detach_handler(handler: logging.FileHandler):
+    for name in _SESSION_LOGGERS:
+        logging.getLogger(name).removeHandler(handler)
+    handler.close()
+
+
+def normalize_mode(mode: str) -> str:
+    mode = (mode or "pseudo").strip().lower()
+    if mode not in {"pseudo", "online"}:
+        raise ValueError(f"Unsupported mode: {mode}")
+    return mode
 
 
 @asynccontextmanager
@@ -47,21 +88,47 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
 @app.websocket("/ws/asr")
-async def websocket_asr(ws: WebSocket):
+async def websocket_asr(
+    ws: WebSocket,
+    mode: str = Query("pseudo"),
+    decoder_step_chunks: int = Query(
+        DEFAULT_DECODER_STEP_CHUNKS,
+        ge=1,
+        le=16,
+    ),
+):
     await ws.accept()
-    session = PseudoStreamingASRSession(
-        model=engine.model,
-        sp=engine.sp,
-        params=engine.params,
-        device=engine.device,
-        decode_interval_samples=1.28 * 16000,
-        min_decode_samples=1.28 * 16000,
-        soft_segment_samples=1.28 * 8 * 16000,
-        hard_segment_samples=1.28 * 14 * 16000,
-        num_decode_chunks=4,
-    )
-    log.info("New pseudo-streaming full-encoder ASR session started")
+    try:
+        mode = normalize_mode(mode)
+    except ValueError as e:
+        await ws.send_json({"error": str(e), "is_final": True})
+        await ws.close(code=1008)
+        return
 
+    if mode == "online":
+        session = SegmentedOnlineASRSession(
+            model=engine.model,
+            sp=engine.sp,
+            params=engine.params,
+            device=engine.device,
+            decoder_step_chunks=decoder_step_chunks,
+        )
+    else:
+        session = PseudoStreamingASRSession(
+            model=engine.model,
+            sp=engine.sp,
+            params=engine.params,
+            device=engine.device,
+            decode_interval_samples=PSEUDO_DECODE_INTERVAL_SAMPLES,
+            min_decode_samples=PSEUDO_DECODE_INTERVAL_SAMPLES,
+            soft_segment_samples=PSEUDO_DECODE_INTERVAL_SAMPLES * 8,
+            hard_segment_samples=PSEUDO_DECODE_INTERVAL_SAMPLES * 14,
+            num_decode_chunks=PSEUDO_NUM_DECODE_CHUNKS,
+        )
+    log.info("New %s ASR session started", mode)
+
+    fh = _make_log_handler(mode)
+    _attach_handler(fh)
     try:
         while True:
             message = await ws.receive()
@@ -92,18 +159,27 @@ async def websocket_asr(ws: WebSocket):
             log.error("ASR session error: %s", e)
     except Exception as e:
         log.error("ASR session error: %s", e, exc_info=True)
+    finally:
+        _detach_handler(fh)
 
 
 @app.post("/api/recognize")
 async def recognize_file(
     file: UploadFile = File(...),
+    mode: str = Query("pseudo"),
     num_decode_chunks: int = Query(4, ge=1, le=16),
 ):
-    """Offline recognition using segmented pseudo-streaming full-encoder decode."""
+    """Offline recognition through the selected streaming path."""
     import io
 
+    try:
+        mode = normalize_mode(mode)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
     log.info(
-        "Offline recognize(pseudo-streaming full-encoder): %s, num_decode_chunks=%d",
+        "Offline recognize(%s): %s, num_decode_chunks=%d",
+        mode,
         file.filename,
         num_decode_chunks,
     )
@@ -124,23 +200,41 @@ async def recognize_file(
     audio_duration = waveform.shape[1] / 16000
     log.info("  Audio: %.2fs, %d samples", audio_duration, waveform.shape[1])
 
+    fh = _make_log_handler(mode)
+    _attach_handler(fh)
     try:
-        result = recognize_pseudo_streaming_waveform(
-            model=engine.model,
-            sp=engine.sp,
-            params=engine.params,
-            device=engine.device,
-            waveform=waveform,
-            num_decode_chunks=num_decode_chunks,
-        )
+        if mode == "online":
+            result = recognize_online_streaming_waveform(
+                model=engine.model,
+                sp=engine.sp,
+                params=engine.params,
+                device=engine.device,
+                waveform=waveform,
+                decoder_step_chunks=num_decode_chunks,
+            )
+        else:
+            result = recognize_pseudo_streaming_waveform(
+                model=engine.model,
+                sp=engine.sp,
+                params=engine.params,
+                device=engine.device,
+                waveform=waveform,
+                decode_interval_samples=PSEUDO_DECODE_INTERVAL_SAMPLES,
+                min_decode_samples=PSEUDO_DECODE_INTERVAL_SAMPLES,
+                soft_segment_samples=PSEUDO_DECODE_INTERVAL_SAMPLES * 8,
+                hard_segment_samples=PSEUDO_DECODE_INTERVAL_SAMPLES * 14,
+                num_decode_chunks=num_decode_chunks,
+            )
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
+    finally:
+        _detach_handler(fh)
 
     log.info(
-        "  Result: %s (decode_calls=%d, committed_segments=%d, elapsed=%.2fs)",
+        "  Result: %s (mode=%s, decode_calls=%d, elapsed=%.2fs)",
         result["text"],
-        result["decode_calls"],
-        result["committed_segments"],
+        mode,
+        result.get("decode_calls", 0),
         result["elapsed"],
     )
 

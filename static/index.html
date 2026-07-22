@@ -36,6 +36,39 @@
             0%, 100% { opacity: 1; }
             50% { opacity: 0.4; }
         }
+        .mode-control {
+            display: inline-flex;
+            border: 1px solid #3a3f58;
+            border-radius: 8px;
+            overflow: hidden;
+            margin-bottom: 16px;
+        }
+        .mode-control input {
+            position: absolute;
+            opacity: 0;
+            pointer-events: none;
+        }
+        .mode-control span {
+            display: block;
+            min-width: 96px;
+            padding: 9px 16px;
+            background: #202744;
+            color: #b8bed2;
+            font-size: 0.9rem;
+            font-weight: 600;
+            text-align: center;
+            cursor: pointer;
+            border-right: 1px solid #3a3f58;
+        }
+        .mode-control label:last-child span { border-right: none; }
+        .mode-control input:checked + span {
+            background: #2196f3;
+            color: white;
+        }
+        .mode-control input:disabled + span {
+            opacity: 0.55;
+            cursor: not-allowed;
+        }
         .controls { margin-bottom: 20px; display: flex; gap: 12px; align-items: center; }
         button {
             padding: 12px 32px;
@@ -137,6 +170,17 @@
     <div class="status">
         <div class="status-dot" id="status-dot"></div>
         <span id="status-text">未连接</span>
+    </div>
+
+    <div class="mode-control" role="group" aria-label="识别模式">
+        <label>
+            <input type="radio" name="session-mode" value="pseudo" checked>
+            <span>Pseudo</span>
+        </label>
+        <label>
+            <input type="radio" name="session-mode" value="online">
+            <span>Online</span>
+        </label>
     </div>
 
     <div class="controls">

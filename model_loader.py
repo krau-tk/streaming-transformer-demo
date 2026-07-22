@@ -1,11 +1,12 @@
 import sys
 import logging
+import os
 from pathlib import Path
 
 import sentencepiece as spm
 import torch
 
-PROJ_DIR = Path("/nfs/bichunhao/uag-zipformer-transformer-streaming")
+PROJ_DIR = Path("/nfs_tmk/asr/bichunhao/uag-zipformer-transformer-streaming")
 ICEFALL_ROOT = Path("/nfs/asr/icefall")
 
 sys.path.insert(0, str(PROJ_DIR / "zipformer"))
@@ -19,9 +20,33 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 BPE_MODEL = PROJ_DIR / "data/bpe_zh_5000_20260602/unigram_5000.model"
-EXP_DIR = PROJ_DIR / "exp/zh_stream_attn_0.0005_20260630"
-EPOCH = 27
-AVG = 5
+EXP_DIR = Path(
+    os.environ.get(
+        "ASR_EXP_DIR",
+        str(PROJ_DIR / "exp/zh_stream_attn_cross_window_0.0005_nanfix_20260721"),
+    )
+)
+EXP_NAME = EXP_DIR.name
+EPOCH = int(os.environ.get("ASR_EPOCH", "11"))
+AVG = int(os.environ.get("ASR_AVG", "1"))
+RESET_DECODER_ON_SENTENCE_BOUNDARY = False
+EXCLUDE_WAIT_FROM_SELF_CACHE = os.environ.get(
+    "ASR_EXCLUDE_WAIT_FROM_SELF_CACHE",
+    "true",
+).lower() in ("1", "true", "yes")
+CROSS_ATTENTION_WINDOW_FRAMES = int(
+    os.environ.get("ASR_CROSS_ATTENTION_WINDOW_FRAMES", "256")
+)
+WAIT_ALTERNATIVE_BEAM_SIZE = int(os.environ.get("ASR_WAIT_ALTERNATIVE_BEAM_SIZE", "1"))
+WAIT_ALTERNATIVE_LOGIT_MARGIN = float(
+    os.environ.get("ASR_WAIT_ALTERNATIVE_LOGIT_MARGIN", "0.35")
+)
+WAIT_ALTERNATIVE_LENGTH_PENALTY = float(
+    os.environ.get("ASR_WAIT_ALTERNATIVE_LENGTH_PENALTY", "1.0")
+)
+WAIT_ALTERNATIVE_MAX_TOKENS = int(
+    os.environ.get("ASR_WAIT_ALTERNATIVE_MAX_TOKENS", "8")
+)
 
 
 class ASREngine:
@@ -65,6 +90,13 @@ class ASREngine:
         params.wait_id = self.sp.piece_to_id("<wait>")
         params.blank_id = self.sp.piece_to_id("<blk>")
         params.max_token_len = 200
+        params.reset_decoder_on_sentence_boundary = RESET_DECODER_ON_SENTENCE_BOUNDARY
+        params.exclude_wait_from_self_cache = EXCLUDE_WAIT_FROM_SELF_CACHE
+        params.cross_attention_window_frames = CROSS_ATTENTION_WINDOW_FRAMES
+        params.wait_alternative_beam_size = WAIT_ALTERNATIVE_BEAM_SIZE
+        params.wait_alternative_logit_margin = WAIT_ALTERNATIVE_LOGIT_MARGIN
+        params.wait_alternative_length_penalty = WAIT_ALTERNATIVE_LENGTH_PENALTY
+        params.wait_alternative_max_tokens = WAIT_ALTERNATIVE_MAX_TOKENS
 
         assert params.wait_id != 0, "<wait> token not found in BPE model"
         log.info("vocab_size=%d, sos/eos=%d, wait=%d", params.vocab_size, params.sos_id, params.wait_id)
