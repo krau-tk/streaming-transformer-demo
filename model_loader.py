@@ -23,11 +23,11 @@ BPE_MODEL = PROJ_DIR / "data/bpe_zh_5000_20260602/unigram_5000.model"
 EXP_DIR = Path(
     os.environ.get(
         "ASR_EXP_DIR",
-        str(PROJ_DIR / "exp/zh_stream_attn_cross_window_0.0005_nanfix_20260721"),
+        str(PROJ_DIR / "exp/zh_stream_attn_cross_window_long_0.0005_20260722"),
     )
 )
 EXP_NAME = EXP_DIR.name
-EPOCH = int(os.environ.get("ASR_EPOCH", "11"))
+EPOCH = int(os.environ.get("ASR_EPOCH", "12"))
 AVG = int(os.environ.get("ASR_AVG", "1"))
 RESET_DECODER_ON_SENTENCE_BOUNDARY = False
 EXCLUDE_WAIT_FROM_SELF_CACHE = os.environ.get(

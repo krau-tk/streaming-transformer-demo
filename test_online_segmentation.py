@@ -56,3 +56,41 @@ def test_hard_rollover_resets_all_state_and_deduplicates_overlap(monkeypatch):
     assert result["segment_reason"] == "hard duration"
     assert result["committed_segments"] == 1
     assert len(FakeOnlineASRSession.instances) == 2
+
+
+class FakeSentenceBoundarySession(FakeOnlineASRSession):
+    def feed_audio(self, _pcm_bytes):
+        if self.index == 0:
+            return {"text": "甲。", "is_final": False}
+        return None
+
+    def finalize(self):
+        if self.index == 0:
+            return {"text": "甲。乙", "is_final": True}
+        return {"text": "", "is_final": True}
+
+
+def test_sentence_boundary_does_not_decode_past_punctuation(monkeypatch):
+    FakeSentenceBoundarySession.instances = []
+    monkeypatch.setattr(
+        online_session,
+        "OnlineASRSession",
+        FakeSentenceBoundarySession,
+    )
+
+    session = online_session.SegmentedOnlineASRSession(
+        model=SimpleNamespace(),
+        sp=SimpleNamespace(),
+        params=SimpleNamespace(),
+        device=torch.device("cpu"),
+        decoder_step_chunks=4,
+        soft_segment_samples=4,
+        hard_segment_samples=8,
+        commit_overlap_samples=2,
+    )
+
+    result = session.feed_audio(np.arange(4, dtype=np.int16).tobytes())
+
+    assert result["text"] == "甲。"
+    assert result["segment_committed"]
+    assert result["segment_reason"] == "sentence boundary"

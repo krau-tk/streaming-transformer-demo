@@ -38,8 +38,8 @@ SAMPLE_RATE = 16000
 SAMPLES_PER_CHUNK = int(FBANK_CHUNK_SHIFT * FRAME_SHIFT_MS / 1000 * SAMPLE_RATE)  # 5120
 DECODER_RESET_WARMUP_CHUNKS = 0
 DEFAULT_DECODER_STEP_CHUNKS = 4
-DEFAULT_ONLINE_SOFT_SEGMENT_SAMPLES = int(5.12 * SAMPLE_RATE)
-DEFAULT_ONLINE_HARD_SEGMENT_SAMPLES = int(8.96 * SAMPLE_RATE)
+DEFAULT_ONLINE_SOFT_SEGMENT_SAMPLES = int(2.56 * SAMPLE_RATE)
+DEFAULT_ONLINE_HARD_SEGMENT_SAMPLES = int(20.48 * SAMPLE_RATE)
 DEFAULT_ONLINE_COMMIT_OVERLAP_SAMPLES = int(1.28 * SAMPLE_RATE)
 
 
@@ -726,8 +726,13 @@ class SegmentedOnlineASRSession:
 
         commit_reason = self._commit_reason()
         if commit_reason is not None:
-            final = self._session.finalize()
-            self._current_text = final.get("text", self._current_text)
+            # Once the live hypothesis already ends at punctuation, finalizing
+            # the old decoder can cross that boundary using buffered audio.
+            # The overlap replay then decodes the same next-sentence audio a
+            # second time, producing exactly the observed duplicated prefix.
+            if commit_reason != "sentence boundary":
+                final = self._session.finalize()
+                self._current_text = final.get("text", self._current_text)
             self._commit_and_rollover(commit_reason)
             return {
                 "text": self._combined_text(),
